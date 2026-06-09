@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NetMon - Server A</title>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0f0f1a;color:#eee;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;overflow-x:hidden}
+.hdr{text-align:center;padding:18px 12px 8px;font-size:20px;font-weight:700;color:#00d4ff;border-bottom:1px solid #1e1e3a}
+.hdr span{font-size:12px;color:#667;margin-left:12px}
+.stats{display:flex;justify-content:center;gap:32px;padding:12px;flex-wrap:wrap}
+.st{text-align:center;min-width:100px}
+.st .v{font-size:22px;font-weight:700;font-variant-numeric:tabular-nums}
+.st .l{font-size:11px;color:#667;margin-top:2px}
+.st.in .v{color:#00d4ff}
+.st.out .v{color:#ff6b6b}
+.st.lat .v{color:#a29bfe}
+.st.drop .v{color:#ffe66d}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;padding:10px}
+.chart{width:100%;height:300px}
+@media(max-width:700px){.grid{grid-template-columns:1fr}.stats{gap:16px}}
+</style>
+</head>
+<body>
+<div class="hdr">⚡ Network Monitor <span id="ifname"></span></div>
+<div class="stats">
+  <div class="st in"><div class="v" id="v-bi">-</div><div class="l">BPS IN</div></div>
+  <div class="st out"><div class="v" id="v-bo">-</div><div class="l">BPS OUT</div></div>
+  <div class="st in"><div class="v" id="v-pi">-</div><div class="l">PPS IN</div></div>
+  <div class="st out"><div class="v" id="v-po">-</div><div class="l">PPS OUT</div></div>
+  <div class="st lat"><div class="v" id="v-lb">-</div><div class="l">LAT →B</div></div>
+  <div class="st lat"><div class="v" id="v-lc">-</div><div class="l">LAT →C</div></div>
+  <div class="st drop"><div class="v" id="v-dr">0</div><div class="l">DROPS/s</div></div>
+</div>
+<div class="grid">
+  <div id="c-bps" class="chart"></div>
+  <div id="c-pps" class="chart"></div>
+  <div id="c-lat" class="chart"></div>
+  <div id="c-drop" class="chart"></div>
+</div>
+<script>
+const C={};
+function mk(id,title,yLabel,series,colors){
+  C[id]=echarts.init(document.getElementById(id));
+  C[id].setOption({
+    backgroundColor:'#141428',
+    title:{text:title,left:10,top:6,textStyle:{fontSize:14,color:'#ccc',fontWeight:600}},
+    tooltip:{trigger:'axis',backgroundColor:'#1a1a3e',borderColor:'#333',textStyle:{color:'#eee',fontSize:12}},
+    legend:{data:series,bottom:4,textStyle:{color:'#888',fontSize:11},itemWidth:16,itemHeight:3},
+    grid:{left:56,right:14,top:38,bottom:32},
+    xAxis:{type:'category',data:[],axisLabel:{color:'#555',fontSize:10},axisLine:{lineStyle:{color:'#222'}},splitLine:{show:false}},
+    yAxis:{type:'value',name:yLabel,nameTextStyle:{color:'#666',fontSize:10},axisLabel:{color:'#555',fontSize:10},axisLine:{show:false},splitLine:{lineStyle:{color:'#1a1a3a'}}},
+    series:series.map((n,i)=>({name:n,type:'line',smooth:true,symbol:'none',lineStyle:{width:2,color:colors[i]},areaStyle:{color:new echarts.graphic.LinearGradient(0,0,0,1,[{offset:0,color:colors[i]+'44'},{offset:1,color:colors[i]+'05'}])},data:[]}))
+  });
+}
+mk('c-bps','Bandwidth','bps',['IN','OUT'],['#00d4ff','#ff6b6b']);
+mk('c-pps','Packet Rate','pps',['IN','OUT'],['#4ecdc4','#ffe66d']);
+mk('c-lat','Latency','ms',['→Server B','→Server C'],['#a29bfe','#fd79a8']);
+mk('c-drop','Drops & Errors','/s',['RX Drop','TX Drop','RX Err','TX Err'],['#ff6b6b','#ee5a24','#ffe66d','#f9ca24']);
+
+function fb(v){if(v>=1e9)return(v/1e9).toFixed(2)+' G';if(v>=1e6)return(v/1e6).toFixed(2)+' M';if(v>=1e3)return(v/1e3).toFixed(1)+' K';return v.toFixed(0)+' '}
+function fp(v){if(v>=1e6)return(v/1e6).toFixed(2)+'M';if(v>=1e3)return(v/1e3).toFixed(1)+'K';return v.toFixed(0)}
+
+async function upd(){
+  try{
+    const r=await fetch('/api/data');const j=await r.json();
+    document.getElementById('ifname').textContent=j.iface;
+    const d=j.data;if(!d.length)return;
+    const last=d[d.length-1];
+    document.getElementById('v-bi').textContent=fb(last.bps_in);
+    document.getElementById('v-bo').textContent=fb(last.bps_out);
+    document.getElementById('v-pi').textContent=fp(last.pps_in);
+    document.getElementById('v-po').textContent=fp(last.pps_out);
+    document.getElementById('v-lb').textContent=last.lat_b>=0?last.lat_b.toFixed(2)+'ms':'--';
+    document.getElementById('v-lc').textContent=last.lat_c>=0?last.lat_c.toFixed(2)+'ms':'--';
+    document.getElementById('v-dr').textContent=last.drop_in+last.drop_out+last.err_in+last.err_out;
+    const ts=d.map(x=>{const dt=new Date(x.t*1000);return dt.getHours().toString().padStart(2,'0')+':'+dt.getMinutes().toString().padStart(2,'0')+':'+dt.getSeconds().toString().padStart(2,'0')});
+    C['c-bps'].setOption({xAxis:{data:ts},yAxis:{axisLabel:{formatter:fb}},series:[{data:d.map(x=>x.bps_in)},{data:d.map(x=>x.bps_out)}]});
+    C['c-pps'].setOption({xAxis:{data:ts},yAxis:{axisLabel:{formatter:fp}},series:[{data:d.map(x=>x.pps_in)},{data:d.map(x=>x.pps_out)}]});
+    C['c-lat'].setOption({xAxis:{data:ts},series:[{data:d.map(x=>x.lat_b)},{data:d.map(x=>x.lat_c)}]});
+    C['c-drop'].setOption({xAxis:{data:ts},series:[{data:d.map(x=>x.drop_in)},{data:d.map(x=>x.drop_out)},{data:d.map(x=>x.err_in)},{data:d.map(x=>x.err_out)}]});
+  }catch(e){console.error(e)}
+}
+setInterval(upd,1000);
+window.addEventListener('resize',()=>{for(const k in C)C[k].resize()});
+</script>
+</body>
+</html>
