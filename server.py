@@ -1,9 +1,26 @@
 #!/usr/bin/env python3
-import http.server, socketserver, json, time, threading, subprocess, os
+import http.server, socketserver, json, time, threading, subprocess, os, hashlib, secrets, urllib.parse
 
 PORT = 8080
 MAX_POINTS = 120
 PEERS = {'B': '10.0.10.14', 'C': '120.131.13.144'}
+
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.json')
+LOGIN_HTML = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'login.html')
+INDEX_HTML = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'index.html')
+
+TOKENS = {}
+CREDENTIALS = {}
+
+def load_config():
+    global CREDENTIALS
+    try:
+        with open(CONFIG_PATH) as f:
+            cfg = json.load(f)
+            CREDENTIALS = {cfg['username']: cfg['password']}
+    except Exception as e:
+        print(f'Warning: failed to load config.json: {e}')
+        CREDENTIALS = {'admin': 'admin'}
 
 history = []
 prev = None
@@ -75,31 +92,99 @@ def ping_loop():
         lat_c = ping(PEERS['C'])
         time.sleep(3)
 
+def get_cookie(headers, name):
+    cookies = headers.get('Cookie', '')
+    for part in cookies.split(';'):
+        part = part.strip()
+        if part.startswith(name + '='):
+            return part.split('=', 1)[1]
+    return None
+
+def check_auth(headers):
+    token = get_cookie(headers, 'token')
+    if token and token in TOKENS:
+        return True
+    return False
+
 class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == '/':
+            if check_auth(self.headers):
+                self.send_response(200)
+                self.send_header('Content-Type','text/html;charset=utf-8')
+                self.end_headers()
+                with open(INDEX_HTML,'rb') as f: self.wfile.write(f.read())
+            else:
+                self.send_response(302)
+                self.send_header('Location','/login')
+                self.end_headers()
+        elif self.path == '/login':
             self.send_response(200)
             self.send_header('Content-Type','text/html;charset=utf-8')
             self.end_headers()
-            p = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'index.html')
-            with open(p,'rb') as f: self.wfile.write(f.read())
+            with open(LOGIN_HTML,'rb') as f: self.wfile.write(f.read())
         elif self.path == '/api/data':
-            self.send_response(200)
-            self.send_header('Content-Type','application/json')
-            self.send_header('Access-Control-Allow-Origin','*')
+            if check_auth(self.headers):
+                self.send_response(200)
+                self.send_header('Content-Type','application/json')
+                self.send_header('Access-Control-Allow-Origin','*')
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    'iface': iface_name,
+                    'data': history
+                }).encode())
+            else:
+                self.send_response(401)
+                self.send_header('Content-Type','application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({'error':'Unauthorized'}).encode())
+        elif self.path == '/logout':
+            token = get_cookie(self.headers, 'token')
+            if token and token in TOKENS:
+                del TOKENS[token]
+            self.send_response(302)
+            self.send_header('Location','/login')
+            self.send_header('Set-Cookie','token=; Path=/; Max-Age=0')
             self.end_headers()
-            self.wfile.write(json.dumps({
-                'iface': iface_name,
-                'data': history
-            }).encode())
         else:
             self.send_error(404)
+
+    def do_POST(self):
+        if self.path == '/api/login':
+            length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(length)
+            try:
+                data = json.loads(body)
+                username = data.get('username', '')
+                password = data.get('password', '')
+                if username in CREDENTIALS and CREDENTIALS[username] == password:
+                    token = secrets.token_hex(32)
+                    TOKENS[token] = username
+                    self.send_response(200)
+                    self.send_header('Content-Type','application/json')
+                    self.send_header('Set-Cookie', f'token={token}; Path=/; HttpOnly; SameSite=Strict')
+                    self.end_headers()
+                    self.wfile.write(json.dumps({'ok': True}).encode())
+                else:
+                    self.send_response(401)
+                    self.send_header('Content-Type','application/json')
+                    self.end_headers()
+                    self.wfile.write(json.dumps({'error':'Invalid username or password'}).encode())
+            except Exception:
+                self.send_response(400)
+                self.send_header('Content-Type','application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({'error':'Bad request'}).encode())
+        else:
+            self.send_error(404)
+
     def log_message(self, fmt, *args): pass
 
 class S(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
 
 if __name__ == '__main__':
+    load_config()
     iface_name = detect_iface()
     print(f'Interface: {iface_name}')
     cur = read_dev(iface_name)
