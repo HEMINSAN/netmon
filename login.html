@@ -23,7 +23,7 @@ body{background:#0f0f1a;color:#eee;font-family:-apple-system,BlinkMacSystemFont,
 <div class="card">
   <div class="logo">⚡</div>
   <h1>NetMon Login</h1>
-  <form id="f" onsubmit="return submit(event)">
+  <form id="f" onsubmit="return doLogin(event)">
     <div class="field"><label>Username</label><input id="u" autocomplete="username" required></div>
     <div class="field"><label>Password</label><input id="p" type="password" autocomplete="current-password" required></div>
     <button class="btn" type="submit">Sign In</button>
@@ -31,7 +31,7 @@ body{background:#0f0f1a;color:#eee;font-family:-apple-system,BlinkMacSystemFont,
   </form>
 </div>
 <script>
-async function submit(e){
+async function doLogin(e){
   e.preventDefault();
   const msg=document.getElementById('msg');
   msg.textContent='';
