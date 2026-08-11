@@ -18,8 +18,16 @@ body{background:#0f0f1a;color:#eee;font-family:-apple-system,BlinkMacSystemFont,
 .st.out .v{color:#ff6b6b}
 .st.lat .v{color:#a29bfe}
 .st.drop .v{color:#ffe66d}
+.st.mem .v{color:#55efc4}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;padding:10px}
 .chart{width:100%;height:300px}
+.hdr2{text-align:center;padding:14px 12px 6px;font-size:16px;font-weight:700;color:#55efc4;border-top:1px solid #1e1e3a;margin-top:8px}
+.ptitle{font-size:14px;color:#ccc;font-weight:600;padding:10px 0 6px}
+.pwrap{height:268px;overflow:auto;background:#141428;border:1px solid #1e1e3a;border-radius:4px}
+.pwrap table{width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:tabular-nums}
+.pwrap th{position:sticky;top:0;background:#1a1a3e;color:#888;font-weight:600;padding:6px 8px;text-align:left;border-bottom:1px solid #1e1e3a}
+.pwrap td{padding:5px 8px;color:#eee;border-bottom:1px solid #1a1a3a}
+.pwrap td.ln{color:#00d4ff;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 @media(max-width:700px){.grid{grid-template-columns:1fr}.stats{gap:16px}}
 </style>
 </head>
@@ -33,12 +41,25 @@ body{background:#0f0f1a;color:#eee;font-family:-apple-system,BlinkMacSystemFont,
   <div class="st lat"><div class="v" id="v-lb">-</div><div class="l">LAT →B</div></div>
   <div class="st lat"><div class="v" id="v-lc">-</div><div class="l">LAT →C</div></div>
   <div class="st drop"><div class="v" id="v-dr">0</div><div class="l">DROPS/s</div></div>
+  <div class="st mem"><div class="v" id="v-mu">-</div><div class="l">MEM USED</div></div>
 </div>
 <div class="grid">
   <div id="c-bps" class="chart"></div>
   <div id="c-pps" class="chart"></div>
   <div id="c-lat" class="chart"></div>
   <div id="c-drop" class="chart"></div>
+</div>
+<div class="hdr2">🖥️ NUMA / Memory Monitor</div>
+<div class="grid">
+  <div id="c-mem" class="chart"></div>
+  <div id="c-break" class="chart"></div>
+</div>
+<div class="grid">
+  <div id="c-procs" class="chart"></div>
+  <div>
+    <div class="ptitle">Top Processes by RSS</div>
+    <div class="pwrap" id="pwrap"></div>
+  </div>
 </div>
 <script>
 const C={};
@@ -59,6 +80,22 @@ mk('c-bps','Bandwidth','bps',['IN','OUT'],['#00d4ff','#ff6b6b']);
 mk('c-pps','Packet Rate','pps',['IN','OUT'],['#4ecdc4','#ffe66d']);
 mk('c-lat','Latency','ms',['→Server B','→Server C'],['#a29bfe','#fd79a8']);
 mk('c-drop','Drops & Errors','/s',['RX Drop','TX Drop','RX Err','TX Err'],['#ff6b6b','#ee5a24','#ffe66d','#f9ca24']);
+
+function mk2(id,title,yLabel){
+  C[id]=echarts.init(document.getElementById(id));
+  C[id].setOption({
+    backgroundColor:'#141428',
+    title:{text:title,left:10,top:6,textStyle:{fontSize:14,color:'#ccc',fontWeight:600}},
+    tooltip:{trigger:'axis',backgroundColor:'#1a1a3e',borderColor:'#333',textStyle:{color:'#eee',fontSize:12}},
+    grid:{left:56,right:14,top:38,bottom:32},
+    xAxis:{type:'category',data:[],axisLabel:{color:'#555',fontSize:10},axisLine:{lineStyle:{color:'#222'}},splitLine:{show:false}},
+    yAxis:{type:'value',name:yLabel,nameTextStyle:{color:'#666',fontSize:10},axisLabel:{color:'#555',fontSize:10},axisLine:{show:false},splitLine:{lineStyle:{color:'#1a1a3a'}}},
+    series:[]
+  });
+}
+mk2('c-mem','Node MemUsed','MB');
+mk2('c-break','Memory Breakdown','MB');
+mk2('c-procs','Top Procs RSS Trend','MB');
 
 function fb(v){if(v>=1e9)return(v/1e9).toFixed(2)+' G';if(v>=1e6)return(v/1e6).toFixed(2)+' M';if(v>=1e3)return(v/1e3).toFixed(1)+' K';return v.toFixed(0)+' '}
 function fp(v){if(v>=1e6)return(v/1e6).toFixed(2)+'M';if(v>=1e3)return(v/1e3).toFixed(1)+'K';return v.toFixed(0)}
@@ -83,7 +120,40 @@ async function upd(){
     C['c-drop'].setOption({xAxis:{data:ts},series:[{data:d.map(x=>x.drop_in)},{data:d.map(x=>x.drop_out)},{data:d.map(x=>x.err_in)},{data:d.map(x=>x.err_out)}]});
   }catch(e){console.error(e)}
 }
+
+async function updNuma(){
+  try{
+    const r=await fetch('/api/numa');const j=await r.json();
+    const d=j.data;if(!d.length)return;
+    const last=d[d.length-1];
+    const used=last.nodes.reduce((a,n)=>a+n.used_kb,0);
+    document.getElementById('v-mu').textContent=fb(used*1024);
+    const ts=d.map(x=>{const dt=new Date(x.t*1000);return dt.getHours().toString().padStart(2,'0')+':'+dt.getMinutes().toString().padStart(2,'0')+':'+dt.getSeconds().toString().padStart(2,'0')});
+    const nodeIds=last.nodes.map(n=>n.node);
+    C['c-mem'].setOption({xAxis:{data:ts},legend:{data:nodeIds.map(n=>'node'+n),bottom:4,textStyle:{color:'#888',fontSize:11},itemWidth:16,itemHeight:3},
+      series:nodeIds.map(nid=>({name:'node'+nid,type:'line',smooth:true,symbol:'none',lineStyle:{width:2},areaStyle:{opacity:0.08},
+        data:d.map(x=>{const nd=(x.nodes||[]).find(n=>n.node===nid);return nd?Math.round(nd.used_kb/1024):null})}))});
+    const brk=[['anon','#ff6b6b'],['file','#4ecdc4'],['slab','#ffe66d'],['shmem','#a29bfe']];
+    C['c-break'].setOption({xAxis:{data:ts},legend:{data:brk.map(b=>b[0]),bottom:4,textStyle:{color:'#888',fontSize:11},itemWidth:16,itemHeight:3},
+      series:brk.map(b=>({name:b[0],type:'line',stack:'m',smooth:true,symbol:'none',lineStyle:{width:1,color:b[1]},areaStyle:{color:b[1]+'55'},
+        data:d.map(x=>{const s=(x.nodes||[]).reduce((a,n)=>a+n[b[0]+'_kb'],0);return Math.round(s/1024)})}))});
+    const top5=(j.top||[]).slice(0,5);
+    C['c-procs'].setOption({xAxis:{data:ts},legend:{type:'scroll',bottom:4,textStyle:{color:'#888',fontSize:10}},
+      series:top5.map(p=>({name:p.name+'('+p.pid+')',type:'line',smooth:true,symbol:'none',lineStyle:{width:2},
+        data:d.map(x=>{const pp=(x.procs||[]).find(q=>q.pid===p.pid);return pp?Math.round(pp.rss_kb/1024):null})}))});
+    const tu=last.nodes.reduce((a,n)=>a+n.used_kb,0);
+    const rows=(j.top||[]).map(p=>{
+      const n0=(p.nodes['N0']||0);
+      const pct=tu?((p.rss_kb/tu)*100).toFixed(1):'0';
+      return '<tr><td>'+p.pid+'</td><td class="ln">'+p.name+'</td><td>'+fb(p.rss_kb*1024)+'</td><td>'+fb(n0*1024)+'</td><td>'+pct+'%</td></tr>';
+    }).join('');
+    document.getElementById('pwrap').innerHTML='<table><tr><th>PID</th><th class="ln">NAME</th><th>RSS</th><th>N0</th><th>%USED</th></tr>'+rows+'</table>';
+  }catch(e){console.error(e)}
+}
+
 setInterval(upd,1000);
+setInterval(updNuma,5000);
+updNuma();
 window.addEventListener('resize',()=>{for(const k in C)C[k].resize()});
 </script>
 </body>
