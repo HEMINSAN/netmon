@@ -19,6 +19,7 @@ body{background:#0f0f1a;color:#eee;font-family:-apple-system,BlinkMacSystemFont,
 .st.lat .v{color:#a29bfe}
 .st.drop .v{color:#ffe66d}
 .st.mem .v{color:#55efc4}
+.st.sock .v{color:#74b9ff}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;padding:10px}
 .chart{width:100%;height:300px}
 .hdr2{text-align:center;padding:14px 12px 6px;font-size:16px;font-weight:700;color:#55efc4;border-top:1px solid #1e1e3a;margin-top:8px}
@@ -42,6 +43,10 @@ body{background:#0f0f1a;color:#eee;font-family:-apple-system,BlinkMacSystemFont,
   <div class="st lat"><div class="v" id="v-lc">-</div><div class="l">LAT →C</div></div>
   <div class="st drop"><div class="v" id="v-dr">0</div><div class="l">DROPS/s</div></div>
   <div class="st mem"><div class="v" id="v-mu">-</div><div class="l">MEM USED</div></div>
+  <div class="st sock"><div class="v" id="v-files">-</div><div class="l">FILES</div></div>
+  <div class="st sock"><div class="v" id="v-estab">-</div><div class="l">ESTAB</div></div>
+  <div class="st sock"><div class="v" id="v-tw">-</div><div class="l">TIME_WAIT</div></div>
+  <div class="st sock" id="st-connt" style="display:none"><div class="v" id="v-connt">-</div><div class="l">CONNT</div></div>
 </div>
 <div class="grid">
   <div id="c-bps" class="chart"></div>
@@ -59,6 +64,22 @@ body{background:#0f0f1a;color:#eee;font-family:-apple-system,BlinkMacSystemFont,
   <div>
     <div class="ptitle">Top Processes by RSS</div>
     <div class="pwrap" id="pwrap"></div>
+  </div>
+</div>
+<div class="hdr2">🔌 Network Stats Monitor</div>
+<div class="grid">
+  <div id="c-tcpstate" class="chart"></div>
+  <div id="c-conn" class="chart"></div>
+</div>
+<div class="grid">
+  <div id="c-fd" class="chart"></div>
+  <div id="c-tcpq" class="chart"></div>
+</div>
+<div class="grid">
+  <div id="c-sock" class="chart"></div>
+  <div>
+    <div class="ptitle">Top Processes by FD</div>
+    <div class="pwrap" id="pwrap-fd"></div>
   </div>
 </div>
 <script>
@@ -96,6 +117,11 @@ function mk2(id,title,yLabel){
 mk2('c-mem','Node MemUsed','MB');
 mk2('c-break','Memory Breakdown','MB');
 mk2('c-procs','Top Procs RSS Trend','MB');
+mk2('c-tcpstate','TCP States','count');
+mk2('c-conn','Connections','count');
+mk2('c-fd','File Descriptors','count');
+mk2('c-tcpq','TCP Quality','/s');
+mk2('c-sock','Sockets','count');
 
 function fb(v){if(v>=1e9)return(v/1e9).toFixed(2)+' G';if(v>=1e6)return(v/1e6).toFixed(2)+' M';if(v>=1e3)return(v/1e3).toFixed(1)+' K';return v.toFixed(0)+' '}
 function fp(v){if(v>=1e6)return(v/1e6).toFixed(2)+'M';if(v>=1e3)return(v/1e3).toFixed(1)+'K';return v.toFixed(0)}
@@ -151,9 +177,51 @@ async function updNuma(){
   }catch(e){console.error(e)}
 }
 
+async function updNetstat(){
+  try{
+    const r=await fetch('/api/netstat');const j=await r.json();
+    const d=j.data;if(!d.length)return;
+    const last=d[d.length-1];
+    document.getElementById('v-files').textContent=last.files.used+' / '+last.files.max;
+    const st=last.tcp_states||{};
+    document.getElementById('v-estab').textContent=st.ESTABLISHED||0;
+    document.getElementById('v-tw').textContent=st.TIME_WAIT||0;
+    if(j.conntrack && last.conntrack){
+      document.getElementById('st-connt').style.display='';
+      document.getElementById('v-connt').textContent=last.conntrack.count+' / '+last.conntrack.max;
+    }
+    const ts=d.map(x=>{const dt=new Date(x.t*1000);return dt.getHours().toString().padStart(2,'0')+':'+dt.getMinutes().toString().padStart(2,'0')+':'+dt.getSeconds().toString().padStart(2,'0')});
+    const lg={data:[],bottom:4,textStyle:{color:'#888',fontSize:11},itemWidth:16,itemHeight:3};
+    const focus=['ESTABLISHED','LISTEN','TIME_WAIT','CLOSE_WAIT','SYN_RECV','FIN_WAIT2'];
+    const pal=['#00d4ff','#55efc4','#ffe66d','#ff6b6b','#a29bfe','#74b9ff'];
+    C['c-tcpstate'].setOption({xAxis:{data:ts},legend:{...lg,data:focus},
+      series:focus.map((nm,i)=>({name:nm,type:'line',stack:'s',smooth:true,symbol:'none',lineStyle:{width:1,color:pal[i]},areaStyle:{color:pal[i]+'55'},
+        data:d.map(x=>(x.tcp_states||{})[nm]||0)}))});
+    const conn=[['ESTABLISHED','#00d4ff'],['TIME_WAIT','#ffe66d'],['CLOSE_WAIT','#ff6b6b'],['orphan','#a29bfe']];
+    C['c-conn'].setOption({xAxis:{data:ts},legend:{...lg,data:conn.map(c=>c[0])},
+      series:conn.map(c=>({name:c[0],type:'line',smooth:true,symbol:'none',lineStyle:{width:2,color:c[1]},
+        data:c[0]==='orphan'?d.map(x=>(x.sockstat||{}).tcp_orphan||0):d.map(x=>(x.tcp_states||{})[c[0]]||0)}))});
+    C['c-fd'].setOption({xAxis:{data:ts},legend:{...lg,data:['used','max']},
+      series:[{name:'used',type:'line',smooth:true,symbol:'none',lineStyle:{width:2,color:'#00d4ff'},areaStyle:{color:'#00d4ff22'},data:d.map(x=>x.files.used)},
+              {name:'max',type:'line',smooth:false,symbol:'none',lineStyle:{width:1,color:'#666',type:'dashed'},data:d.map(x=>x.files.max)}]});
+    const q=[['retranssegs','#ff6b6b'],['tcpsynretrans','#ffe66d'],['listenoverflows','#a29bfe']];
+    C['c-tcpq'].setOption({xAxis:{data:ts},legend:{...lg,data:q.map(c=>c[0])},
+      series:q.map(c=>({name:c[0],type:'line',smooth:true,symbol:'none',lineStyle:{width:2,color:c[1]},
+        data:d.map(x=>(x.tcp_rates||{})[c[0]]||0)}))});
+    const sk=[['tcp_inuse','#00d4ff'],['udp_inuse','#4ecdc4'],['unix','#a29bfe'],['total','#55efc4']];
+    C['c-sock'].setOption({xAxis:{data:ts},legend:{...lg,data:sk.map(c=>c[0])},
+      series:sk.map(c=>({name:c[0],type:'line',smooth:true,symbol:'none',lineStyle:{width:2,color:c[1]},
+        data:d.map(x=>(x.sockstat||{})[c[0]]||0)}))});
+    const rows=(j.top_fds||[]).map(p=>'<tr><td>'+p.pid+'</td><td class="ln">'+p.name+'</td><td>'+p.fd_count+'</td><td>'+fb(p.rss_kb*1024)+'</td></tr>').join('');
+    document.getElementById('pwrap-fd').innerHTML='<table><tr><th>PID</th><th class="ln">NAME</th><th>FD</th><th>RSS</th></tr>'+rows+'</table>';
+  }catch(e){console.error(e)}
+}
+
 setInterval(upd,1000);
 setInterval(updNuma,5000);
+setInterval(updNetstat,5000);
 updNuma();
+updNetstat();
 window.addEventListener('resize',()=>{for(const k in C)C[k].resize()});
 </script>
 </body>

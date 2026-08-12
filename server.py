@@ -11,6 +11,11 @@ MEM_POINTS = 2880       # 内存历史保留点数（5s × 2880 = 4h）
 TOP_N = 10              # top 进程数量
 MEM_LOG_FILE = 'numa_log.jsonl'   # 长期日志文件，置空字符串则关闭
 
+# 网络关联指标默认参数（可被 config.json 覆盖）
+NETSTAT_INTERVAL = 5    # 采样间隔（秒）
+NETSTAT_POINTS = 2880   # 历史保留点数（5s × 2880 = 4h）
+TOP_FDS_N = 10          # top fd 进程数量
+
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.json')
 LOGIN_HTML = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'login.html')
 INDEX_HTML = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'index.html')
@@ -20,6 +25,7 @@ CREDENTIALS = {}
 
 def load_config():
     global CREDENTIALS, MEM_INTERVAL, MEM_POINTS, TOP_N, MEM_LOG_FILE
+    global NETSTAT_INTERVAL, NETSTAT_POINTS, TOP_FDS_N
     try:
         with open(CONFIG_PATH) as f:
             cfg = json.load(f)
@@ -28,6 +34,9 @@ def load_config():
             MEM_POINTS = cfg.get('mem_points', MEM_POINTS)
             TOP_N = cfg.get('top_n', TOP_N)
             MEM_LOG_FILE = cfg.get('mem_log_file', MEM_LOG_FILE)
+            NETSTAT_INTERVAL = cfg.get('netstat_interval', NETSTAT_INTERVAL)
+            NETSTAT_POINTS = cfg.get('netstat_points', NETSTAT_POINTS)
+            TOP_FDS_N = cfg.get('top_fds_n', TOP_FDS_N)
     except Exception as e:
         print(f'Warning: failed to load config.json: {e}')
         CREDENTIALS = {'admin': 'admin'}
@@ -44,6 +53,13 @@ mem_top = []
 mem_avail = 0
 mem_prev_numastat = {}
 mem_prev_ts = 0
+
+# 网络关联指标历史与状态
+netstat_history = []
+netstat_top_fds = []
+netstat_prev = {}
+netstat_prev_ts = 0
+netstat_conntrack = False
 
 def detect_iface():
     with open('/proc/net/dev') as f:
@@ -258,6 +274,225 @@ def collect_mem():
                 pass
         time.sleep(MEM_INTERVAL)
 
+# ---- 网络关联指标采集 ----
+# /proc/net/tcp[*] 第4列十六进制状态码 -> 名称
+TCP_STATES = {
+    '01': 'ESTABLISHED', '02': 'SYN_SENT', '03': 'SYN_RECV',
+    '04': 'FIN_WAIT1', '05': 'FIN_WAIT2', '06': 'TIME_WAIT',
+    '07': 'CLOSE', '08': 'CLOSE_WAIT', '09': 'LAST_ACK',
+    '0A': 'LISTEN', '0B': 'CLOSING', '0C': 'NEW_SYN_RECV',
+}
+
+def read_file_nr():
+    try:
+        with open('/proc/sys/fs/file-nr') as f:
+            p = f.read().split()
+            return {'used': int(p[0]), 'max': int(p[2])}
+    except Exception:
+        return {'used': 0, 'max': 0}
+
+def read_sockstat():
+    s = {'total': 0, 'tcp_inuse': 0, 'tcp_orphan': 0, 'tcp_tw': 0, 'tcp_alloc': 0,
+         'udp_inuse': 0, 'raw_inuse': 0, 'unix': 0}
+    def parse_pairs(line):
+        d = {}
+        parts = line.split()
+        for i in range(1, len(parts) - 1, 2):
+            try:
+                d[parts[i]] = int(parts[i + 1])
+            except Exception:
+                pass
+        return d
+    for fn in ('/proc/net/sockstat', '/proc/net/sockstat6'):
+        try:
+            with open(fn) as f:
+                for line in f:
+                    if line.startswith('sockets:'):
+                        try:
+                            s['total'] = int(line.split(':')[1].split()[1])
+                        except Exception:
+                            pass
+                    elif line.startswith('TCP') and 'inuse' in line:
+                        d = parse_pairs(line)
+                        s['tcp_inuse'] += d.get('inuse', 0)
+                        s['tcp_orphan'] += d.get('orphan', 0)
+                        s['tcp_tw'] += d.get('tw', 0)
+                        s['tcp_alloc'] += d.get('alloc', 0)
+                    elif line.startswith('UDP') and 'inuse' in line:
+                        s['udp_inuse'] += parse_pairs(line).get('inuse', 0)
+                    elif line.startswith('RAW') and 'inuse' in line:
+                        s['raw_inuse'] += parse_pairs(line).get('inuse', 0)
+        except Exception:
+            pass
+    try:
+        n = 0
+        with open('/proc/net/unix') as f:
+            for _ in f:
+                n += 1
+        s['unix'] = max(0, n - 1)
+    except Exception:
+        pass
+    return s
+
+def read_tcp_states():
+    counts = {}
+    for fn in ('/proc/net/tcp', '/proc/net/tcp6'):
+        try:
+            with open(fn) as f:
+                next(f, None)
+                for line in f:
+                    p = line.split()
+                    if len(p) >= 4:
+                        name = TCP_STATES.get(p[3], p[3])
+                        counts[name] = counts.get(name, 0) + 1
+        except Exception:
+            pass
+    return counts
+
+def _read_kv_pairs(path, section):
+    """解析 /proc/net/snmp|netstat 中「Section: h1 h2 ...」+「Section: v1 v2 ...」成对格式，返回该 section 的 {key:int}。"""
+    out = {}
+    try:
+        with open(path) as f:
+            lines = f.readlines()
+        hdr = {}
+        for line in lines:
+            p = line.split(':', 1)
+            if len(p) != 2:
+                continue
+            name = p[0].strip()
+            cols = p[1].split()
+            if name == section and name in hdr:
+                d = dict(zip(hdr[name], cols))
+                for k, v in d.items():
+                    try:
+                        out[k] = int(v)
+                    except Exception:
+                        pass
+            elif name not in hdr:
+                hdr[name] = cols
+    except Exception:
+        pass
+    return out
+
+def read_tcp_counters():
+    return _read_kv_pairs('/proc/net/snmp', 'Tcp')
+
+def read_tcpext():
+    return _read_kv_pairs('/proc/net/netstat', 'TcpExt')
+
+def read_softirq_net():
+    out = {'net_rx': 0, 'net_tx': 0}
+    try:
+        with open('/proc/softirqs') as f:
+            for line in f:
+                p = line.split()
+                if not p:
+                    continue
+                head = p[0].rstrip(':')
+                if head == 'NET_RX':
+                    out['net_rx'] = sum(int(x) for x in p[1:])
+                elif head == 'NET_TX':
+                    out['net_tx'] = sum(int(x) for x in p[1:])
+    except Exception:
+        pass
+    return out
+
+def read_conntrack():
+    try:
+        with open('/proc/sys/net/netfilter/nf_conntrack_count') as f:
+            c = int(f.read().strip())
+        with open('/proc/sys/net/netfilter/nf_conntrack_max') as f:
+            m = int(f.read().strip())
+        return {'count': c, 'max': m}
+    except Exception:
+        return None
+
+def read_top_fds(n):
+    procs = []
+    try:
+        for name in os.listdir('/proc'):
+            if not name.isdigit():
+                continue
+            try:
+                fds = len(os.listdir(f'/proc/{name}/fd'))
+                pname = ''
+                rss = 0
+                with open(f'/proc/{name}/status') as f:
+                    for line in f:
+                        if line.startswith('Name:'):
+                            pname = line.split(':', 1)[1].strip()
+                        elif line.startswith('VmRSS:'):
+                            rss = int(line.split()[1])
+                procs.append((int(name), pname, fds, rss))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    procs.sort(key=lambda x: -x[2])
+    return [{'pid': p[0], 'name': p[1], 'fd_count': p[2], 'rss_kb': p[3]} for p in procs[:n]]
+
+def collect_netstat():
+    global netstat_history, netstat_top_fds, netstat_prev, netstat_prev_ts, netstat_conntrack
+    tcp_keys = ['ActiveOpens', 'PassiveOpens', 'AttemptFails', 'EstabResets',
+                'InSegs', 'OutSegs', 'RetransSegs', 'InErrs', 'OutRsts']
+    te_keys = ['ListenOverflows', 'ListenDrops', 'TCPSynRetrans',
+               'TCPReqQFullDrop', 'TCPTimeWaitOverflow']
+    while True:
+        now = time.time()
+        dt = now - netstat_prev_ts if netstat_prev_ts else 0
+        files = read_file_nr()
+        sock = read_sockstat()
+        states = read_tcp_states()
+        tcp_cnt = read_tcp_counters()
+        tcpext = read_tcpext()
+        softirq = read_softirq_net()
+        conntrack = read_conntrack()
+        top_fds = read_top_fds(TOP_FDS_N)
+        netstat_conntrack = conntrack is not None
+
+        def rate(pk, cur):
+            pv = netstat_prev.get(pk)
+            return round((cur - pv) / dt, 0) if (pv is not None and dt > 0) else 0
+
+        tcp_rates = {}
+        for k in tcp_keys:
+            tcp_rates[k.lower()] = rate('tcp.' + k, tcp_cnt.get(k, 0))
+        outs = tcp_rates.get('outsegs', 0)
+        r = tcp_rates.get('retranssegs', 0)
+        tcp_rates['retrans_rate'] = round(r / outs * 100, 2) if outs > 0 else 0
+        te_rates = {}
+        for k in te_keys:
+            te_rates[k.lower()] = rate('te.' + k, tcpext.get(k, 0))
+        si_rates = {
+            'net_rx': rate('si.net_rx', softirq.get('net_rx', 0)),
+            'net_tx': rate('si.net_tx', softirq.get('net_tx', 0)),
+        }
+        pt = {
+            't': round(now, 1),
+            'files': files,
+            'sockstat': sock,
+            'tcp_states': states,
+            'tcp_rates': tcp_rates,
+            'tcpext_rates': te_rates,
+            'softirq_rates': si_rates,
+            'conntrack': conntrack,
+            'top_fds': top_fds,
+        }
+        netstat_history.append(pt)
+        if len(netstat_history) > NETSTAT_POINTS:
+            del netstat_history[0]
+        netstat_top_fds = top_fds
+        netstat_prev = {}
+        for k in tcp_keys:
+            netstat_prev['tcp.' + k] = tcp_cnt.get(k, 0)
+        for k in te_keys:
+            netstat_prev['te.' + k] = tcpext.get(k, 0)
+        netstat_prev['si.net_rx'] = softirq.get('net_rx', 0)
+        netstat_prev['si.net_tx'] = softirq.get('net_tx', 0)
+        netstat_prev_ts = now
+        time.sleep(NETSTAT_INTERVAL)
+
 def get_cookie(headers, name):
     cookies = headers.get('Cookie', '')
     for part in cookies.split(';'):
@@ -322,6 +557,22 @@ class H(http.server.BaseHTTPRequestHandler):
                 self.send_header('Content-Type','application/json')
                 self.end_headers()
                 self.wfile.write(json.dumps({'error':'Unauthorized'}).encode())
+        elif self.path == '/api/netstat':
+            if check_auth(self.headers):
+                self.send_response(200)
+                self.send_header('Content-Type','application/json')
+                self.send_header('Access-Control-Allow-Origin','*')
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    'data': netstat_history,
+                    'top_fds': netstat_top_fds,
+                    'conntrack': netstat_conntrack,
+                }).encode())
+            else:
+                self.send_response(401)
+                self.send_header('Content-Type','application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({'error':'Unauthorized'}).encode())
         elif self.path == '/logout':
             token = get_cookie(self.headers, 'token')
             if token and token in TOKENS:
@@ -376,6 +627,7 @@ if __name__ == '__main__':
     threading.Thread(target=collect, args=(iface_name,), daemon=True).start()
     threading.Thread(target=ping_loop, daemon=True).start()
     threading.Thread(target=collect_mem, daemon=True).start()
+    threading.Thread(target=collect_netstat, daemon=True).start()
     s = S(('0.0.0.0', PORT), H)
     print(f'http://0.0.0.0:{PORT}')
     s.serve_forever()
