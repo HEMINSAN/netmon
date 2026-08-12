@@ -70,7 +70,7 @@ function mk(id,title,yLabel,series,colors){
     title:{text:title,left:10,top:6,textStyle:{fontSize:14,color:'#ccc',fontWeight:600}},
     tooltip:{trigger:'axis',backgroundColor:'#1a1a3e',borderColor:'#333',textStyle:{color:'#eee',fontSize:12}},
     legend:{data:series,bottom:4,textStyle:{color:'#888',fontSize:11},itemWidth:16,itemHeight:3},
-    grid:{left:56,right:14,top:38,bottom:32},
+    grid:{left:56,right:14,top:38,bottom:50},
     xAxis:{type:'category',data:[],axisLabel:{color:'#555',fontSize:10},axisLine:{lineStyle:{color:'#222'}},splitLine:{show:false}},
     yAxis:{type:'value',name:yLabel,nameTextStyle:{color:'#666',fontSize:10},axisLabel:{color:'#555',fontSize:10},axisLine:{show:false},splitLine:{lineStyle:{color:'#1a1a3a'}}},
     series:series.map((n,i)=>({name:n,type:'line',smooth:true,symbol:'none',lineStyle:{width:2,color:colors[i]},areaStyle:{color:new echarts.graphic.LinearGradient(0,0,0,1,[{offset:0,color:colors[i]+'44'},{offset:1,color:colors[i]+'05'}])},data:[]}))
@@ -87,7 +87,7 @@ function mk2(id,title,yLabel){
     backgroundColor:'#141428',
     title:{text:title,left:10,top:6,textStyle:{fontSize:14,color:'#ccc',fontWeight:600}},
     tooltip:{trigger:'axis',backgroundColor:'#1a1a3e',borderColor:'#333',textStyle:{color:'#eee',fontSize:12}},
-    grid:{left:56,right:14,top:38,bottom:32},
+    grid:{left:56,right:14,top:38,bottom:50},
     xAxis:{type:'category',data:[],axisLabel:{color:'#555',fontSize:10},axisLine:{lineStyle:{color:'#222'}},splitLine:{show:false}},
     yAxis:{type:'value',name:yLabel,nameTextStyle:{color:'#666',fontSize:10},axisLabel:{color:'#555',fontSize:10},axisLine:{show:false},splitLine:{lineStyle:{color:'#1a1a3a'}}},
     series:[]
