@@ -22,11 +22,25 @@ body{background:#0f0f1a;color:#eee;font-family:-apple-system,BlinkMacSystemFont,
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;padding:10px}
 .chart{width:100%;height:300px}
 .hdr2{text-align:center;padding:14px 12px 6px;font-size:16px;font-weight:700;color:#74b9ff;border-top:1px solid #1e1e3a;margin-top:8px}
-@media(max-width:700px){.grid{grid-template-columns:1fr}.stats{gap:16px}}
+.ctrl{display:flex;justify-content:center;gap:28px;padding:8px 12px;flex-wrap:wrap;border-bottom:1px solid #1e1e3a}
+.cg{display:flex;align-items:center;gap:8px}
+.cl{font-size:11px;color:#667}
+#sel-iface{background:#1a1a3e;color:#eee;border:1px solid #2a2a4e;border-radius:4px;padding:3px 6px;font-size:12px;outline:none;cursor:pointer}
+.btns{display:flex;gap:4px}
+.btns button{background:#1a1a3e;color:#889;border:1px solid #2a2a4e;border-radius:4px;padding:3px 9px;font-size:11px;cursor:pointer;transition:.15s}
+.btns button:hover{color:#ccd;border-color:#3a3a5e}
+.btns button.on{background:#00d4ff;color:#0f0f1a;border-color:#00d4ff;font-weight:600}
+@media(max-width:700px){.grid{grid-template-columns:1fr}.stats{gap:16px}.ctrl{gap:12px}}
 </style>
 </head>
 <body>
-<div class="hdr">⚡ Network Monitor <span id="ifname"></span> <a href="/logout" style="float:right;font-size:12px;color:#667;text-decoration:none">Logout</a></div>
+<div class="hdr">⚡ Network Monitor <a href="/logout" style="float:right;font-size:12px;color:#667;text-decoration:none">Logout</a></div>
+<div class="ctrl">
+  <div class="cg"><span class="cl">接口</span><select id="sel-iface"></select></div>
+  <div class="cg"><span class="cl">间隔</span><div class="btns" id="ci-btns">
+    <button data-ci="1">1s</button><button data-ci="2">2s</button><button data-ci="3">3s</button><button data-ci="5">5s</button><button data-ci="10">10s</button><button data-ci="30">30s</button>
+  </div></div>
+</div>
 <div class="stats">
   <div class="st in"><div class="v" id="v-bi">-</div><div class="l">BPS IN</div></div>
   <div class="st out"><div class="v" id="v-bo">-</div><div class="l">BPS OUT</div></div>
@@ -89,16 +103,25 @@ function fp(v){if(v>=1e6)return(v/1e6).toFixed(2)+'M';if(v>=1e3)return(v/1e3).to
 async function upd(){
   try{
     const r=await fetch('/api/data');const j=await r.json();
-    document.getElementById('ifname').textContent=j.iface;
-    const d=j.data;if(!d.length)return;
-    const last=d[d.length-1];
-    document.getElementById('v-bi').textContent=fb(last.bps_in);
-    document.getElementById('v-bo').textContent=fb(last.bps_out);
-    document.getElementById('v-pi').textContent=fp(last.pps_in);
-    document.getElementById('v-po').textContent=fp(last.pps_out);
-    document.getElementById('v-lb').textContent=last.lat_b>=0?last.lat_b.toFixed(2)+'ms':'--';
-    document.getElementById('v-lc').textContent=last.lat_c>=0?last.lat_c.toFixed(2)+'ms':'--';
-    document.getElementById('v-dr').textContent=last.drop_in+last.drop_out+last.err_in+last.err_out;
+    const d=j.data||[];
+    const last=d.length?d[d.length-1]:null;
+    if(last){
+      document.getElementById('v-bi').textContent=fb(last.bps_in);
+      document.getElementById('v-bo').textContent=fb(last.bps_out);
+      document.getElementById('v-pi').textContent=fp(last.pps_in);
+      document.getElementById('v-po').textContent=fp(last.pps_out);
+      document.getElementById('v-lb').textContent=last.lat_b>=0?last.lat_b.toFixed(2)+'ms':'--';
+      document.getElementById('v-lc').textContent=last.lat_c>=0?last.lat_c.toFixed(2)+'ms':'--';
+      document.getElementById('v-dr').textContent=last.drop_in+last.drop_out+last.err_in+last.err_out;
+    }else{
+      document.getElementById('v-bi').textContent='-';
+      document.getElementById('v-bo').textContent='-';
+      document.getElementById('v-pi').textContent='-';
+      document.getElementById('v-po').textContent='-';
+      document.getElementById('v-lb').textContent='--';
+      document.getElementById('v-lc').textContent='--';
+      document.getElementById('v-dr').textContent='0';
+    }
     const ts=d.map(x=>{const dt=new Date(x.t*1000);return dt.getHours().toString().padStart(2,'0')+':'+dt.getMinutes().toString().padStart(2,'0')+':'+dt.getSeconds().toString().padStart(2,'0')});
     C['c-bps'].setOption({xAxis:{data:ts},yAxis:{axisLabel:{formatter:fb}},series:[{data:d.map(x=>x.bps_in)},{data:d.map(x=>x.bps_out)}]});
     C['c-pps'].setOption({xAxis:{data:ts},yAxis:{axisLabel:{formatter:fp}},series:[{data:d.map(x=>x.pps_in)},{data:d.map(x=>x.pps_out)}]});
@@ -127,16 +150,62 @@ async function updNetstat(){
   }catch(e){console.error(e)}
 }
 
-let CHART_INTERVAL=3000;
-async function initConfig(){
-  try{const j=await(await fetch('/api/config')).json();CHART_INTERVAL=(j.chart_interval||3)*1000;}catch(e){}
+let CHART_INTERVAL=3000, CUR_IFACE='', IFACES=[], tData=null, tNet=null;
+
+async function apiConfig(method, body){
+  const opt = method==='POST'
+    ? {method:'POST',headers:{'Content-Type':'application/json'},credentials:'same-origin',body:JSON.stringify(body)}
+    : {credentials:'same-origin'};
+  const r = await fetch('/api/config', opt);
+  if(r.status===401 && method==='POST'){ location.href='/login'; return {}; }
+  return r.json();
+}
+function applyConfig(j){
+  if(typeof j.chart_interval==='number') CHART_INTERVAL=j.chart_interval*1000;
+  if(typeof j.iface==='string') CUR_IFACE=j.iface;
+  if(Array.isArray(j.ifaces)) IFACES=j.ifaces;
+  const sel=document.getElementById('sel-iface');
+  sel.innerHTML=IFACES.map(i=>`<option value="${i}" ${i===CUR_IFACE?'selected':''}>${i}</option>`).join('');
+  document.querySelectorAll('#ci-btns button').forEach(b=>{
+    b.classList.toggle('on', parseInt(b.dataset.ci)*1000===CHART_INTERVAL);
+  });
+}
+async function postConfig(body){
+  try{ const j=await apiConfig('POST', body); applyConfig(j); return j; }catch(e){ return null; }
+}
+function startPolling(){
+  if(tData)clearInterval(tData);
+  if(tNet)clearInterval(tNet);
+  tData=setInterval(upd,CHART_INTERVAL);
+  tNet=setInterval(updNetstat,CHART_INTERVAL);
+}
+async function initConfig(){ try{ applyConfig(await apiConfig('GET')); }catch(e){} }
+async function restoreSaved(){
+  let sc=localStorage.getItem('nm_ci'), si=localStorage.getItem('nm_iface');
+  sc=sc!==null?parseInt(sc):NaN;
+  const wants={};
+  if(si && IFACES.includes(si) && si!==CUR_IFACE) wants.iface=si;
+  if(!isNaN(sc) && sc>=1 && sc<=30 && sc*1000!==CHART_INTERVAL) wants.chart_interval=sc;
+  if(Object.keys(wants).length) await postConfig(wants);
 }
 async function start(){
   await initConfig();
+  await restoreSaved();
   upd();updNetstat();
-  setInterval(upd,CHART_INTERVAL);
-  setInterval(updNetstat,CHART_INTERVAL);
+  startPolling();
 }
+document.getElementById('sel-iface').addEventListener('change', async e=>{
+  const iface=e.target.value;
+  const n=await postConfig({iface});
+  if(n){ localStorage.setItem('nm_iface', iface); upd(); }
+});
+document.querySelectorAll('#ci-btns button').forEach(b=>{
+  b.addEventListener('click', async ()=>{
+    const ci=parseInt(b.dataset.ci);
+    const n=await postConfig({chart_interval:ci});
+    if(n){ localStorage.setItem('nm_ci', ci); startPolling(); }
+  });
+});
 start();
 window.addEventListener('resize',()=>{for(const k in C)C[k].resize()});
 </script>

@@ -47,6 +47,19 @@ def detect_iface():
                 return p[0].strip()
     return 'eth0'
 
+def list_ifaces():
+    # 返回 /proc/net/dev 里所有接口（含 lo），供前端下拉选择
+    ifaces = []
+    try:
+        with open('/proc/net/dev') as f:
+            for line in f.readlines()[2:]:
+                p = line.strip().split(':')
+                if len(p) == 2:
+                    ifaces.append(p[0].strip())
+    except Exception:
+        pass
+    return ifaces
+
 def read_dev(iface):
     with open('/proc/net/dev') as f:
         for line in f.readlines()[2:]:
@@ -67,11 +80,18 @@ def ping(host):
     except: pass
     return -1
 
-def collect(iface):
+def collect():
     global prev, prev_ts, lat_b, lat_c
+    cur_iface = iface_name
     while True:
+        # 接口被前端切换时，重置基线并清空旧接口的历史（避免跨接口 delta 尖刺）
+        if iface_name != cur_iface:
+            cur_iface = iface_name
+            prev = None
+            prev_ts = 0
+            history.clear()
         now = time.time()
-        cur = read_dev(iface)
+        cur = read_dev(cur_iface)
         if cur and prev:
             dt = now - prev_ts
             if dt > 0:
@@ -219,7 +239,11 @@ class H(http.server.BaseHTTPRequestHandler):
             self.send_header('Content-Type','application/json')
             self.send_header('Access-Control-Allow-Origin','*')
             self.end_headers()
-            self.wfile.write(json.dumps({'chart_interval': CHART_INTERVAL}).encode())
+            self.wfile.write(json.dumps({
+                'chart_interval': CHART_INTERVAL,
+                'iface': iface_name,
+                'ifaces': list_ifaces(),
+            }).encode())
         elif self.path == '/api/data':
             if check_auth(self.headers):
                 self.send_response(200)
@@ -261,6 +285,7 @@ class H(http.server.BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self):
+        global CHART_INTERVAL, iface_name
         if self.path == '/api/login':
             length = int(self.headers.get('Content-Length', 0))
             body = self.rfile.read(length)
@@ -286,6 +311,35 @@ class H(http.server.BaseHTTPRequestHandler):
                 self.send_header('Content-Type','application/json')
                 self.end_headers()
                 self.wfile.write(json.dumps({'error':'Bad request'}).encode())
+        elif self.path == '/api/config':
+            if not check_auth(self.headers):
+                self.send_response(401)
+                self.send_header('Content-Type','application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({'error':'Unauthorized'}).encode())
+                return
+            length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(length)
+            try:
+                data = json.loads(body)
+            except Exception:
+                data = {}
+            if 'chart_interval' in data:
+                try:
+                    CHART_INTERVAL = max(1, min(30, int(data['chart_interval'])))
+                except (TypeError, ValueError):
+                    pass
+            if 'iface' in data and data['iface'] in list_ifaces():
+                iface_name = data['iface']
+            self.send_response(200)
+            self.send_header('Content-Type','application/json')
+            self.send_header('Access-Control-Allow-Origin','*')
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                'chart_interval': CHART_INTERVAL,
+                'iface': iface_name,
+                'ifaces': list_ifaces(),
+            }).encode())
         else:
             self.send_error(404)
 
@@ -300,7 +354,7 @@ if __name__ == '__main__':
     print(f'Interface: {iface_name}')
     cur = read_dev(iface_name)
     if cur: prev, prev_ts = cur, time.time()
-    threading.Thread(target=collect, args=(iface_name,), daemon=True).start()
+    threading.Thread(target=collect, daemon=True).start()
     threading.Thread(target=ping_loop, daemon=True).start()
     threading.Thread(target=collect_netstat, daemon=True).start()
     s = S(('0.0.0.0', PORT), H)
