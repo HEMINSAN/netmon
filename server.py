@@ -1,20 +1,13 @@
 #!/usr/bin/env python3
-import http.server, socketserver, json, time, threading, subprocess, os, hashlib, secrets, urllib.parse, glob
+import http.server, socketserver, json, time, threading, subprocess, os, secrets
 
 PORT = 8080
 MAX_POINTS = 120
 PEERS = {'B': '10.0.10.14', 'C': '120.131.13.144'}
 
-# NUMA / 内存监控默认参数（可被 config.json 覆盖）
-MEM_INTERVAL = 5        # 采样间隔（秒）
-MEM_POINTS = 2880       # 内存历史保留点数（5s × 2880 = 4h）
-TOP_N = 10              # top 进程数量
-MEM_LOG_FILE = 'numa_log.jsonl'   # 长期日志文件，置空字符串则关闭
-
-# 网络关联指标默认参数（可被 config.json 覆盖）
+# socket/TCP 状态采样参数（可被 config.json 覆盖）
 NETSTAT_INTERVAL = 5    # 采样间隔（秒）
 NETSTAT_POINTS = 2880   # 历史保留点数（5s × 2880 = 4h）
-TOP_FDS_N = 10          # top fd 进程数量
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.json')
 LOGIN_HTML = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'login.html')
@@ -24,19 +17,13 @@ TOKENS = {}
 CREDENTIALS = {}
 
 def load_config():
-    global CREDENTIALS, MEM_INTERVAL, MEM_POINTS, TOP_N, MEM_LOG_FILE
-    global NETSTAT_INTERVAL, NETSTAT_POINTS, TOP_FDS_N
+    global CREDENTIALS, NETSTAT_INTERVAL, NETSTAT_POINTS
     try:
         with open(CONFIG_PATH) as f:
             cfg = json.load(f)
             CREDENTIALS = {cfg['username']: cfg['password']}
-            MEM_INTERVAL = cfg.get('mem_interval', MEM_INTERVAL)
-            MEM_POINTS = cfg.get('mem_points', MEM_POINTS)
-            TOP_N = cfg.get('top_n', TOP_N)
-            MEM_LOG_FILE = cfg.get('mem_log_file', MEM_LOG_FILE)
             NETSTAT_INTERVAL = cfg.get('netstat_interval', NETSTAT_INTERVAL)
             NETSTAT_POINTS = cfg.get('netstat_points', NETSTAT_POINTS)
-            TOP_FDS_N = cfg.get('top_fds_n', TOP_FDS_N)
     except Exception as e:
         print(f'Warning: failed to load config.json: {e}')
         CREDENTIALS = {'admin': 'admin'}
@@ -46,20 +33,7 @@ prev = None
 prev_ts = 0
 lat_b = -1
 lat_c = -1
-
-# 内存历史与状态
-mem_history = []
-mem_top = []
-mem_avail = 0
-mem_prev_numastat = {}
-mem_prev_ts = 0
-
-# 网络关联指标历史与状态
 netstat_history = []
-netstat_top_fds = []
-netstat_prev = {}
-netstat_prev_ts = 0
-netstat_conntrack = False
 
 def detect_iface():
     with open('/proc/net/dev') as f:
@@ -125,156 +99,7 @@ def ping_loop():
         lat_c = ping(PEERS['C'])
         time.sleep(3)
 
-# ---- NUMA / 内存采集 ----
-def read_node_meminfo(node_dir):
-    d = {}
-    try:
-        with open(os.path.join(node_dir, 'meminfo')) as f:
-            for line in f:
-                if ':' not in line:
-                    continue
-                k, v = line.split(':', 1)
-                parts = k.split()
-                if len(parts) >= 3 and parts[0] == 'Node':
-                    key = ' '.join(parts[2:])      # "Node 0 MemTotal" -> "MemTotal"
-                else:
-                    key = k.strip()
-                d[key] = int(v.split()[0])
-    except Exception:
-        pass
-    return d
-
-def read_node_numastat(node_dir):
-    d = {}
-    try:
-        with open(os.path.join(node_dir, 'numastat')) as f:
-            for line in f:
-                p = line.split()
-                if len(p) == 2:
-                    try:
-                        d[p[0]] = int(p[1])
-                    except Exception:
-                        pass
-    except Exception:
-        pass
-    return d
-
-def read_mem_avail():
-    try:
-        with open('/proc/meminfo') as f:
-            for line in f:
-                if line.startswith('MemAvailable'):
-                    return int(line.split()[1])
-    except Exception:
-        pass
-    return -1
-
-def read_top_procs(n):
-    procs = []
-    try:
-        for name in os.listdir('/proc'):
-            if not name.isdigit():
-                continue
-            try:
-                rss = 0
-                pname = ''
-                with open(f'/proc/{name}/status') as f:
-                    for line in f:
-                        if line.startswith('Name:'):
-                            pname = line.split(':', 1)[1].strip()
-                        elif line.startswith('VmRSS:'):
-                            rss = int(line.split()[1])
-                if rss > 0:
-                    procs.append((int(name), pname, rss))
-            except Exception:
-                pass
-    except Exception:
-        pass
-    procs.sort(key=lambda x: -x[2])
-    out = []
-    for pid, pname, rss in procs[:n]:
-        nodes = {}
-        try:
-            with open(f'/proc/{pid}/numa_maps') as f:
-                for line in f:
-                    for tok in line.split():
-                        if tok.startswith('N') and '=' in tok:
-                            nk, nv = tok.split('=', 1)
-                            try:
-                                nodes[nk] = nodes.get(nk, 0) + int(nv)
-                            except Exception:
-                                pass
-        except Exception:
-            pass
-        out.append({
-            'pid': pid,
-            'name': pname,
-            'rss_kb': rss,
-            'nodes': {k: v * 4 for k, v in nodes.items()},   # pages -> kB
-        })
-    return out
-
-def collect_mem():
-    global mem_history, mem_top, mem_avail, mem_prev_numastat, mem_prev_ts
-    node_dirs = [os.path.dirname(p) for p in sorted(glob.glob('/sys/devices/system/node/node[0-9]*/meminfo'))]
-    log_path = None
-    if MEM_LOG_FILE:
-        log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), MEM_LOG_FILE)
-    while True:
-        now = time.time()
-        dt = now - mem_prev_ts if mem_prev_ts else 0
-        nodes_out = []
-        numastat_out = []
-        for nd in node_dirs:
-            mi = read_node_meminfo(nd)
-            ns = read_node_numastat(nd)
-            node_id = int(os.path.basename(nd).replace('node', ''))
-            nodes_out.append({
-                'node': node_id,
-                'total_kb': mi.get('MemTotal', 0),
-                'free_kb': mi.get('MemFree', 0),
-                'used_kb': mi.get('MemUsed', 0),
-                'anon_kb': mi.get('Active(anon)', 0) + mi.get('Inactive(anon)', 0) + mi.get('AnonPages', 0),
-                'file_kb': mi.get('Active(file)', 0) + mi.get('Inactive(file)', 0),
-                'slab_kb': mi.get('Slab', 0),
-                'shmem_kb': mi.get('Shmem', 0),
-                'hugepages': mi.get('HugePages_Total', 0),
-            })
-            prev_ns = mem_prev_numastat.get(node_id)
-            if prev_ns and dt > 0:
-                numastat_out.append({
-                    'node': node_id,
-                    'hit_rate': round((ns.get('numa_hit', 0) - prev_ns.get('numa_hit', 0)) / dt, 0),
-                    'foreign_rate': round((ns.get('numa_foreign', 0) - prev_ns.get('numa_foreign', 0)) / dt, 0),
-                    'other_rate': round((ns.get('other_node', 0) - prev_ns.get('other_node', 0)) / dt, 0),
-                    'miss_rate': round((ns.get('numa_miss', 0) - prev_ns.get('numa_miss', 0)) / dt, 0),
-                })
-            else:
-                numastat_out.append({'node': node_id, 'hit_rate': 0, 'foreign_rate': 0, 'other_rate': 0, 'miss_rate': 0})
-            mem_prev_numastat[node_id] = ns
-        mem_avail = read_mem_avail()
-        procs = read_top_procs(TOP_N)
-        pt = {
-            't': round(now, 1),
-            'nodes': nodes_out,
-            'mem_avail_kb': mem_avail,
-            'numastat': numastat_out,
-            'procs': procs,
-        }
-        mem_history.append(pt)
-        if len(mem_history) > MEM_POINTS:
-            del mem_history[0]
-        mem_top = procs
-        mem_prev_ts = now
-        if log_path:
-            try:
-                with open(log_path, 'a') as f:
-                    f.write(json.dumps(pt) + '\n')
-            except Exception:
-                pass
-        time.sleep(MEM_INTERVAL)
-
-# ---- 网络关联指标采集 ----
+# ---- socket / TCP 状态采集 ----
 # /proc/net/tcp[*] 第4列十六进制状态码 -> 名称
 TCP_STATES = {
     '01': 'ESTABLISHED', '02': 'SYN_SENT', '03': 'SYN_RECV',
@@ -282,14 +107,6 @@ TCP_STATES = {
     '07': 'CLOSE', '08': 'CLOSE_WAIT', '09': 'LAST_ACK',
     '0A': 'LISTEN', '0B': 'CLOSING', '0C': 'NEW_SYN_RECV',
 }
-
-def read_file_nr():
-    try:
-        with open('/proc/sys/fs/file-nr') as f:
-            p = f.read().split()
-            return {'used': int(p[0]), 'max': int(p[2])}
-    except Exception:
-        return {'used': 0, 'max': 0}
 
 def read_sockstat():
     s = {'total': 0, 'tcp_inuse': 0, 'tcp_orphan': 0, 'tcp_tw': 0, 'tcp_alloc': 0,
@@ -349,148 +166,17 @@ def read_tcp_states():
             pass
     return counts
 
-def _read_kv_pairs(path, section):
-    """解析 /proc/net/snmp|netstat 中「Section: h1 h2 ...」+「Section: v1 v2 ...」成对格式，返回该 section 的 {key:int}。"""
-    out = {}
-    try:
-        with open(path) as f:
-            lines = f.readlines()
-        hdr = {}
-        for line in lines:
-            p = line.split(':', 1)
-            if len(p) != 2:
-                continue
-            name = p[0].strip()
-            cols = p[1].split()
-            if name == section and name in hdr:
-                d = dict(zip(hdr[name], cols))
-                for k, v in d.items():
-                    try:
-                        out[k] = int(v)
-                    except Exception:
-                        pass
-            elif name not in hdr:
-                hdr[name] = cols
-    except Exception:
-        pass
-    return out
-
-def read_tcp_counters():
-    return _read_kv_pairs('/proc/net/snmp', 'Tcp')
-
-def read_tcpext():
-    return _read_kv_pairs('/proc/net/netstat', 'TcpExt')
-
-def read_softirq_net():
-    out = {'net_rx': 0, 'net_tx': 0}
-    try:
-        with open('/proc/softirqs') as f:
-            for line in f:
-                p = line.split()
-                if not p:
-                    continue
-                head = p[0].rstrip(':')
-                if head == 'NET_RX':
-                    out['net_rx'] = sum(int(x) for x in p[1:])
-                elif head == 'NET_TX':
-                    out['net_tx'] = sum(int(x) for x in p[1:])
-    except Exception:
-        pass
-    return out
-
-def read_conntrack():
-    try:
-        with open('/proc/sys/net/netfilter/nf_conntrack_count') as f:
-            c = int(f.read().strip())
-        with open('/proc/sys/net/netfilter/nf_conntrack_max') as f:
-            m = int(f.read().strip())
-        return {'count': c, 'max': m}
-    except Exception:
-        return None
-
-def read_top_fds(n):
-    procs = []
-    try:
-        for name in os.listdir('/proc'):
-            if not name.isdigit():
-                continue
-            try:
-                fds = len(os.listdir(f'/proc/{name}/fd'))
-                pname = ''
-                rss = 0
-                with open(f'/proc/{name}/status') as f:
-                    for line in f:
-                        if line.startswith('Name:'):
-                            pname = line.split(':', 1)[1].strip()
-                        elif line.startswith('VmRSS:'):
-                            rss = int(line.split()[1])
-                procs.append((int(name), pname, fds, rss))
-            except Exception:
-                pass
-    except Exception:
-        pass
-    procs.sort(key=lambda x: -x[2])
-    return [{'pid': p[0], 'name': p[1], 'fd_count': p[2], 'rss_kb': p[3]} for p in procs[:n]]
-
 def collect_netstat():
-    global netstat_history, netstat_top_fds, netstat_prev, netstat_prev_ts, netstat_conntrack
-    tcp_keys = ['ActiveOpens', 'PassiveOpens', 'AttemptFails', 'EstabResets',
-                'InSegs', 'OutSegs', 'RetransSegs', 'InErrs', 'OutRsts']
-    te_keys = ['ListenOverflows', 'ListenDrops', 'TCPSynRetrans',
-               'TCPReqQFullDrop', 'TCPTimeWaitOverflow']
+    global netstat_history
     while True:
-        now = time.time()
-        dt = now - netstat_prev_ts if netstat_prev_ts else 0
-        files = read_file_nr()
-        sock = read_sockstat()
-        states = read_tcp_states()
-        tcp_cnt = read_tcp_counters()
-        tcpext = read_tcpext()
-        softirq = read_softirq_net()
-        conntrack = read_conntrack()
-        top_fds = read_top_fds(TOP_FDS_N)
-        netstat_conntrack = conntrack is not None
-
-        def rate(pk, cur):
-            pv = netstat_prev.get(pk)
-            return round((cur - pv) / dt, 0) if (pv is not None and dt > 0) else 0
-
-        tcp_rates = {}
-        for k in tcp_keys:
-            tcp_rates[k.lower()] = rate('tcp.' + k, tcp_cnt.get(k, 0))
-        outs = tcp_rates.get('outsegs', 0)
-        r = tcp_rates.get('retranssegs', 0)
-        tcp_rates['retrans_rate'] = round(r / outs * 100, 2) if outs > 0 else 0
-        te_rates = {}
-        for k in te_keys:
-            te_rates[k.lower()] = rate('te.' + k, tcpext.get(k, 0))
-        si_rates = {
-            'net_rx': rate('si.net_rx', softirq.get('net_rx', 0)),
-            'net_tx': rate('si.net_tx', softirq.get('net_tx', 0)),
-        }
         pt = {
-            't': round(now, 1),
-            'files': files,
-            'sockstat': sock,
-            'tcp_states': states,
-            'tcp_rates': tcp_rates,
-            'tcpext_rates': te_rates,
-            'softirq_rates': si_rates,
-            'conntrack': conntrack,
-            'top_fds': top_fds,
+            't': round(time.time(), 1),
+            'sockstat': read_sockstat(),
+            'tcp_states': read_tcp_states(),
         }
         netstat_history.append(pt)
         if len(netstat_history) > NETSTAT_POINTS:
             del netstat_history[0]
-        netstat_top_fds = top_fds
-        netstat_prev = {}
-        for k in tcp_keys:
-            netstat_prev['tcp.' + k] = tcp_cnt.get(k, 0)
-        for k in te_keys:
-            netstat_prev['te.' + k] = tcpext.get(k, 0)
-        netstat_prev['si.net_rx'] = softirq.get('net_rx', 0)
-        netstat_prev['si.net_tx'] = softirq.get('net_tx', 0)
-        netstat_prev_ts = now
         time.sleep(NETSTAT_INTERVAL)
 
 def get_cookie(headers, name):
@@ -539,24 +225,6 @@ class H(http.server.BaseHTTPRequestHandler):
                 self.send_header('Content-Type','application/json')
                 self.end_headers()
                 self.wfile.write(json.dumps({'error':'Unauthorized'}).encode())
-        elif self.path == '/api/numa':
-            if check_auth(self.headers):
-                self.send_response(200)
-                self.send_header('Content-Type','application/json')
-                self.send_header('Access-Control-Allow-Origin','*')
-                self.end_headers()
-                nodes_list = sorted({nd['node'] for nd in (mem_history[-1]['nodes'] if mem_history else [])})
-                self.wfile.write(json.dumps({
-                    'nodes': nodes_list,
-                    'data': mem_history,
-                    'top': mem_top,
-                    'mem_avail_kb': mem_avail,
-                }).encode())
-            else:
-                self.send_response(401)
-                self.send_header('Content-Type','application/json')
-                self.end_headers()
-                self.wfile.write(json.dumps({'error':'Unauthorized'}).encode())
         elif self.path == '/api/netstat':
             if check_auth(self.headers):
                 self.send_response(200)
@@ -565,8 +233,6 @@ class H(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(json.dumps({
                     'data': netstat_history,
-                    'top_fds': netstat_top_fds,
-                    'conntrack': netstat_conntrack,
                 }).encode())
             else:
                 self.send_response(401)
@@ -626,7 +292,6 @@ if __name__ == '__main__':
     if cur: prev, prev_ts = cur, time.time()
     threading.Thread(target=collect, args=(iface_name,), daemon=True).start()
     threading.Thread(target=ping_loop, daemon=True).start()
-    threading.Thread(target=collect_mem, daemon=True).start()
     threading.Thread(target=collect_netstat, daemon=True).start()
     s = S(('0.0.0.0', PORT), H)
     print(f'http://0.0.0.0:{PORT}')

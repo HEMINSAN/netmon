@@ -1,11 +1,6 @@
 {
   "username": "admin",
   "password": "changeme",
-  "mem_interval": 5,
-  "mem_points": 2880,
-  "top_n": 10,
-  "mem_log_file": "numa_log.jsonl",
   "netstat_interval": 5,
-  "netstat_points": 2880,
-  "top_fds_n": 10
+  "netstat_points": 2880
 }

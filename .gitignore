@@ -2,4 +2,3 @@ __pycache__/
 *.pyc
 .env
 config.json
-numa_log.jsonl

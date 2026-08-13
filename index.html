@@ -18,17 +18,10 @@ body{background:#0f0f1a;color:#eee;font-family:-apple-system,BlinkMacSystemFont,
 .st.out .v{color:#ff6b6b}
 .st.lat .v{color:#a29bfe}
 .st.drop .v{color:#ffe66d}
-.st.mem .v{color:#55efc4}
 .st.sock .v{color:#74b9ff}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;padding:10px}
 .chart{width:100%;height:300px}
-.hdr2{text-align:center;padding:14px 12px 6px;font-size:16px;font-weight:700;color:#55efc4;border-top:1px solid #1e1e3a;margin-top:8px}
-.ptitle{font-size:14px;color:#ccc;font-weight:600;padding:10px 0 6px}
-.pwrap{height:268px;overflow:auto;background:#141428;border:1px solid #1e1e3a;border-radius:4px}
-.pwrap table{width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:tabular-nums}
-.pwrap th{position:sticky;top:0;background:#1a1a3e;color:#888;font-weight:600;padding:6px 8px;text-align:left;border-bottom:1px solid #1e1e3a}
-.pwrap td{padding:5px 8px;color:#eee;border-bottom:1px solid #1a1a3a}
-.pwrap td.ln{color:#00d4ff;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hdr2{text-align:center;padding:14px 12px 6px;font-size:16px;font-weight:700;color:#74b9ff;border-top:1px solid #1e1e3a;margin-top:8px}
 @media(max-width:700px){.grid{grid-template-columns:1fr}.stats{gap:16px}}
 </style>
 </head>
@@ -42,11 +35,7 @@ body{background:#0f0f1a;color:#eee;font-family:-apple-system,BlinkMacSystemFont,
   <div class="st lat"><div class="v" id="v-lb">-</div><div class="l">LAT →B</div></div>
   <div class="st lat"><div class="v" id="v-lc">-</div><div class="l">LAT →C</div></div>
   <div class="st drop"><div class="v" id="v-dr">0</div><div class="l">DROPS/s</div></div>
-  <div class="st mem"><div class="v" id="v-mu">-</div><div class="l">MEM USED</div></div>
-  <div class="st sock"><div class="v" id="v-files">-</div><div class="l">FILES</div></div>
-  <div class="st sock"><div class="v" id="v-estab">-</div><div class="l">ESTAB</div></div>
-  <div class="st sock"><div class="v" id="v-tw">-</div><div class="l">TIME_WAIT</div></div>
-  <div class="st sock" id="st-connt" style="display:none"><div class="v" id="v-connt">-</div><div class="l">CONNT</div></div>
+  <div class="st sock"><div class="v" id="v-sock">-</div><div class="l">SOCKETS</div></div>
 </div>
 <div class="grid">
   <div id="c-bps" class="chart"></div>
@@ -54,33 +43,10 @@ body{background:#0f0f1a;color:#eee;font-family:-apple-system,BlinkMacSystemFont,
   <div id="c-lat" class="chart"></div>
   <div id="c-drop" class="chart"></div>
 </div>
-<div class="hdr2">🖥️ NUMA / Memory Monitor</div>
-<div class="grid">
-  <div id="c-mem" class="chart"></div>
-  <div id="c-break" class="chart"></div>
-</div>
-<div class="grid">
-  <div id="c-procs" class="chart"></div>
-  <div>
-    <div class="ptitle">Top Processes by RSS</div>
-    <div class="pwrap" id="pwrap"></div>
-  </div>
-</div>
 <div class="hdr2">🔌 Network Stats Monitor</div>
 <div class="grid">
   <div id="c-tcpstate" class="chart"></div>
-  <div id="c-conn" class="chart"></div>
-</div>
-<div class="grid">
-  <div id="c-fd" class="chart"></div>
-  <div id="c-tcpq" class="chart"></div>
-</div>
-<div class="grid">
   <div id="c-sock" class="chart"></div>
-  <div>
-    <div class="ptitle">Top Processes by FD</div>
-    <div class="pwrap" id="pwrap-fd"></div>
-  </div>
 </div>
 <script>
 const C={};
@@ -114,13 +80,7 @@ function mk2(id,title,yLabel){
     series:[]
   });
 }
-mk2('c-mem','Node MemUsed','MB');
-mk2('c-break','Memory Breakdown','MB');
-mk2('c-procs','Top Procs RSS Trend','MB');
 mk2('c-tcpstate','TCP States','count');
-mk2('c-conn','Connections','count');
-mk2('c-fd','File Descriptors','count');
-mk2('c-tcpq','TCP Quality','/s');
 mk2('c-sock','Sockets','count');
 
 function fb(v){if(v>=1e9)return(v/1e9).toFixed(2)+' G';if(v>=1e6)return(v/1e6).toFixed(2)+' M';if(v>=1e3)return(v/1e3).toFixed(1)+' K';return v.toFixed(0)+' '}
@@ -147,49 +107,12 @@ async function upd(){
   }catch(e){console.error(e)}
 }
 
-async function updNuma(){
-  try{
-    const r=await fetch('/api/numa');const j=await r.json();
-    const d=j.data;if(!d.length)return;
-    const last=d[d.length-1];
-    const used=last.nodes.reduce((a,n)=>a+n.used_kb,0);
-    document.getElementById('v-mu').textContent=fb(used*1024);
-    const ts=d.map(x=>{const dt=new Date(x.t*1000);return dt.getHours().toString().padStart(2,'0')+':'+dt.getMinutes().toString().padStart(2,'0')+':'+dt.getSeconds().toString().padStart(2,'0')});
-    const nodeIds=last.nodes.map(n=>n.node);
-    C['c-mem'].setOption({xAxis:{data:ts},legend:{data:nodeIds.map(n=>'node'+n),bottom:4,textStyle:{color:'#888',fontSize:11},itemWidth:16,itemHeight:3},
-      series:nodeIds.map(nid=>({name:'node'+nid,type:'line',smooth:true,symbol:'none',lineStyle:{width:2},areaStyle:{opacity:0.08},
-        data:d.map(x=>{const nd=(x.nodes||[]).find(n=>n.node===nid);return nd?Math.round(nd.used_kb/1024):null})}))});
-    const brk=[['anon','#ff6b6b'],['file','#4ecdc4'],['slab','#ffe66d'],['shmem','#a29bfe']];
-    C['c-break'].setOption({xAxis:{data:ts},legend:{data:brk.map(b=>b[0]),bottom:4,textStyle:{color:'#888',fontSize:11},itemWidth:16,itemHeight:3},
-      series:brk.map(b=>({name:b[0],type:'line',stack:'m',smooth:true,symbol:'none',lineStyle:{width:1,color:b[1]},areaStyle:{color:b[1]+'55'},
-        data:d.map(x=>{const s=(x.nodes||[]).reduce((a,n)=>a+n[b[0]+'_kb'],0);return Math.round(s/1024)})}))});
-    const top5=(j.top||[]).slice(0,5);
-    C['c-procs'].setOption({xAxis:{data:ts},legend:{type:'scroll',bottom:4,textStyle:{color:'#888',fontSize:10}},
-      series:top5.map(p=>({name:p.name+'('+p.pid+')',type:'line',smooth:true,symbol:'none',lineStyle:{width:2},
-        data:d.map(x=>{const pp=(x.procs||[]).find(q=>q.pid===p.pid);return pp?Math.round(pp.rss_kb/1024):null})}))});
-    const tu=last.nodes.reduce((a,n)=>a+n.used_kb,0);
-    const rows=(j.top||[]).map(p=>{
-      const n0=(p.nodes['N0']||0);
-      const pct=tu?((p.rss_kb/tu)*100).toFixed(1):'0';
-      return '<tr><td>'+p.pid+'</td><td class="ln">'+p.name+'</td><td>'+fb(p.rss_kb*1024)+'</td><td>'+fb(n0*1024)+'</td><td>'+pct+'%</td></tr>';
-    }).join('');
-    document.getElementById('pwrap').innerHTML='<table><tr><th>PID</th><th class="ln">NAME</th><th>RSS</th><th>N0</th><th>%USED</th></tr>'+rows+'</table>';
-  }catch(e){console.error(e)}
-}
-
 async function updNetstat(){
   try{
     const r=await fetch('/api/netstat');const j=await r.json();
     const d=j.data;if(!d.length)return;
     const last=d[d.length-1];
-    document.getElementById('v-files').textContent=last.files.used+' / '+last.files.max;
-    const st=last.tcp_states||{};
-    document.getElementById('v-estab').textContent=st.ESTABLISHED||0;
-    document.getElementById('v-tw').textContent=st.TIME_WAIT||0;
-    if(j.conntrack && last.conntrack){
-      document.getElementById('st-connt').style.display='';
-      document.getElementById('v-connt').textContent=last.conntrack.count+' / '+last.conntrack.max;
-    }
+    document.getElementById('v-sock').textContent=last.sockstat.total||0;
     const ts=d.map(x=>{const dt=new Date(x.t*1000);return dt.getHours().toString().padStart(2,'0')+':'+dt.getMinutes().toString().padStart(2,'0')+':'+dt.getSeconds().toString().padStart(2,'0')});
     const lg={data:[],bottom:4,textStyle:{color:'#888',fontSize:11},itemWidth:16,itemHeight:3};
     const focus=['ESTABLISHED','LISTEN','TIME_WAIT','CLOSE_WAIT','SYN_RECV','FIN_WAIT2'];
@@ -197,30 +120,15 @@ async function updNetstat(){
     C['c-tcpstate'].setOption({xAxis:{data:ts},legend:{...lg,data:focus},
       series:focus.map((nm,i)=>({name:nm,type:'line',stack:'s',smooth:true,symbol:'none',lineStyle:{width:1,color:pal[i]},areaStyle:{color:pal[i]+'55'},
         data:d.map(x=>(x.tcp_states||{})[nm]||0)}))});
-    const conn=[['ESTABLISHED','#00d4ff'],['TIME_WAIT','#ffe66d'],['CLOSE_WAIT','#ff6b6b'],['orphan','#a29bfe']];
-    C['c-conn'].setOption({xAxis:{data:ts},legend:{...lg,data:conn.map(c=>c[0])},
-      series:conn.map(c=>({name:c[0],type:'line',smooth:true,symbol:'none',lineStyle:{width:2,color:c[1]},
-        data:c[0]==='orphan'?d.map(x=>(x.sockstat||{}).tcp_orphan||0):d.map(x=>(x.tcp_states||{})[c[0]]||0)}))});
-    C['c-fd'].setOption({xAxis:{data:ts},legend:{...lg,data:['used','max']},
-      series:[{name:'used',type:'line',smooth:true,symbol:'none',lineStyle:{width:2,color:'#00d4ff'},areaStyle:{color:'#00d4ff22'},data:d.map(x=>x.files.used)},
-              {name:'max',type:'line',smooth:false,symbol:'none',lineStyle:{width:1,color:'#666',type:'dashed'},data:d.map(x=>x.files.max)}]});
-    const q=[['retranssegs','#ff6b6b'],['tcpsynretrans','#ffe66d'],['listenoverflows','#a29bfe']];
-    C['c-tcpq'].setOption({xAxis:{data:ts},legend:{...lg,data:q.map(c=>c[0])},
-      series:q.map(c=>({name:c[0],type:'line',smooth:true,symbol:'none',lineStyle:{width:2,color:c[1]},
-        data:d.map(x=>(x.tcp_rates||{})[c[0]]||0)}))});
     const sk=[['tcp_inuse','#00d4ff'],['udp_inuse','#4ecdc4'],['unix','#a29bfe'],['total','#55efc4']];
     C['c-sock'].setOption({xAxis:{data:ts},legend:{...lg,data:sk.map(c=>c[0])},
       series:sk.map(c=>({name:c[0],type:'line',smooth:true,symbol:'none',lineStyle:{width:2,color:c[1]},
         data:d.map(x=>(x.sockstat||{})[c[0]]||0)}))});
-    const rows=(j.top_fds||[]).map(p=>'<tr><td>'+p.pid+'</td><td class="ln">'+p.name+'</td><td>'+p.fd_count+'</td><td>'+fb(p.rss_kb*1024)+'</td></tr>').join('');
-    document.getElementById('pwrap-fd').innerHTML='<table><tr><th>PID</th><th class="ln">NAME</th><th>FD</th><th>RSS</th></tr>'+rows+'</table>';
   }catch(e){console.error(e)}
 }
 
 setInterval(upd,1000);
-setInterval(updNuma,5000);
 setInterval(updNetstat,5000);
-updNuma();
 updNetstat();
 window.addEventListener('resize',()=>{for(const k in C)C[k].resize()});
 </script>
