@@ -1,6 +1,6 @@
 {
   "username": "admin",
   "password": "changeme",
-  "netstat_interval": 5,
+  "chart_interval": 3,
   "netstat_points": 2880
 }

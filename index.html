@@ -127,9 +127,17 @@ async function updNetstat(){
   }catch(e){console.error(e)}
 }
 
-setInterval(upd,1000);
-setInterval(updNetstat,5000);
-updNetstat();
+let CHART_INTERVAL=3000;
+async function initConfig(){
+  try{const j=await(await fetch('/api/config')).json();CHART_INTERVAL=(j.chart_interval||3)*1000;}catch(e){}
+}
+async function start(){
+  await initConfig();
+  upd();updNetstat();
+  setInterval(upd,CHART_INTERVAL);
+  setInterval(updNetstat,CHART_INTERVAL);
+}
+start();
 window.addEventListener('resize',()=>{for(const k in C)C[k].resize()});
 </script>
 </body>

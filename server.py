@@ -5,9 +5,9 @@ PORT = 8080
 MAX_POINTS = 120
 PEERS = {'B': '10.0.10.14', 'C': '120.131.13.144'}
 
-# socket/TCP 状态采样参数（可被 config.json 覆盖）
-NETSTAT_INTERVAL = 5    # 采样间隔（秒）
-NETSTAT_POINTS = 2880   # 历史保留点数（5s × 2880 = 4h）
+# socket/TCP 状态采样 + 前端绘图间隔参数（可被 config.json 覆盖）
+CHART_INTERVAL = 3      # 绘图间隔（秒），范围 1~30，前端轮询与后端 socket/TCP 采样共用
+NETSTAT_POINTS = 2880   # 历史保留点数
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.json')
 LOGIN_HTML = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'login.html')
@@ -17,12 +17,16 @@ TOKENS = {}
 CREDENTIALS = {}
 
 def load_config():
-    global CREDENTIALS, NETSTAT_INTERVAL, NETSTAT_POINTS
+    global CREDENTIALS, CHART_INTERVAL, NETSTAT_POINTS
     try:
         with open(CONFIG_PATH) as f:
             cfg = json.load(f)
             CREDENTIALS = {cfg['username']: cfg['password']}
-            NETSTAT_INTERVAL = cfg.get('netstat_interval', NETSTAT_INTERVAL)
+            try:
+                ci = int(cfg.get('chart_interval', CHART_INTERVAL))
+                CHART_INTERVAL = max(1, min(30, ci))
+            except (TypeError, ValueError):
+                CHART_INTERVAL = 3
             NETSTAT_POINTS = cfg.get('netstat_points', NETSTAT_POINTS)
     except Exception as e:
         print(f'Warning: failed to load config.json: {e}')
@@ -177,7 +181,7 @@ def collect_netstat():
         netstat_history.append(pt)
         if len(netstat_history) > NETSTAT_POINTS:
             del netstat_history[0]
-        time.sleep(NETSTAT_INTERVAL)
+        time.sleep(CHART_INTERVAL)
 
 def get_cookie(headers, name):
     cookies = headers.get('Cookie', '')
@@ -210,6 +214,12 @@ class H(http.server.BaseHTTPRequestHandler):
             self.send_header('Content-Type','text/html;charset=utf-8')
             self.end_headers()
             with open(LOGIN_HTML,'rb') as f: self.wfile.write(f.read())
+        elif self.path == '/api/config':
+            self.send_response(200)
+            self.send_header('Content-Type','application/json')
+            self.send_header('Access-Control-Allow-Origin','*')
+            self.end_headers()
+            self.wfile.write(json.dumps({'chart_interval': CHART_INTERVAL}).encode())
         elif self.path == '/api/data':
             if check_auth(self.headers):
                 self.send_response(200)
